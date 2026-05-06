@@ -92,6 +92,29 @@ wheels = [
 ]
 
 [[package]]
+name = "akong-agent-base"
+version = "0.2.0"
+source = { directory = "../akong-agent-base" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "dashscope" },
+    { name = "fastapi" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cryptography", specifier = ">=43.0" },
+    { name = "dashscope", specifier = ">=1.20" },
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
+    { name = "pydantic", specifier = ">=2.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
+]
+provides-extras = ["dev"]
+
+[[package]]
 name = "annotated-doc"
 version = "0.0.4"
 source = { registry = "https://pypi.org/simple" }
@@ -486,6 +509,7 @@ name = "mail-dayou-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "akong-agent-base" },
     { name = "cryptography" },
     { name = "dashscope" },
     { name = "email-validator" },
@@ -496,6 +520,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "akong-agent-base", directory = "../akong-agent-base" },
     { name = "cryptography", specifier = ">=43.0" },
     { name = "dashscope", specifier = ">=1.20" },
     { name = "email-validator", specifier = ">=2.3.0" },
