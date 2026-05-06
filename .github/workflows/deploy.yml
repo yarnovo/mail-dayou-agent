@@ -1,8 +1,7 @@
 name: deploy
-# FC v3 Custom Runtime · ZIP 部署 · v0.2 切 akong-agent-base lib
+# FC v3 Custom Container · ACR 部署 (老板 5-7 切容器镜像 · 替 ZIP)
 #
-# 流程: clone akong-agent-base sibling → uv pip 装依赖到 python/ → zip → OSS → FC 拉
-# 凭证: OSS_AK + OSS_SK + DAYOU_MASTER_KEY + DASHSCOPE_API_KEY (GHA secrets)
+# 流程: clone akong-agent-base sibling → docker build → push ACR → fc PUT custom-container
 
 on:
   push:
@@ -10,17 +9,20 @@ on:
     paths:
       - "src/**"
       - "skills/**"
+      - "workspace/**"
+      - "Dockerfile"
       - "pyproject.toml"
       - "uv.lock"
-      - "workspace/**"
       - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
 env:
   REGION: cn-hangzhou
+  REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  REGISTRY_VPC: registry-vpc.cn-hangzhou.aliyuncs.com
+  NAMESPACE: agentaily
+  IMAGE_NAME: mail-dayou-agent
   FC_FUNCTION: mail-dayou-agent
-  OSS_BUCKET: agentaily-fc-zips
-  ACCOUNT_ID: "1577573550634833"
 
 jobs:
   deploy:
@@ -28,56 +30,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python 3.11 (跟 FC custom.debian12 内置 python3.11 一致)
-        uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-
-      - name: Clone akong-agent-base v0.2 (sibling · pyproject [tool.uv.sources] 引)
+      - name: Clone akong-agent-base v0.2 (build context sibling)
         run: |
-          cd ..
-          rm -rf akong-agent-base
-          git clone --depth 1 --branch v0.2.0 https://github.com/yarnovo/akong-agent-base.git
-          ls akong-agent-base/
+          git clone --depth 1 --branch v0.2.0 https://github.com/yarnovo/akong-agent-base.git akong-agent-base
+          ls akong-agent-base
 
-      - name: 打 ZIP (src + workspace + pip 装依赖到 python/)
-        run: |
-          set -e
-          pip install --quiet uv
-          # uv 解析 [tool.uv.sources] · akong-agent-base 走 ../akong-agent-base
-          uv pip install --target=./python --python-platform x86_64-manylinux2014 --python-version 3.11 -r <(uv pip compile pyproject.toml --python-version 3.11) || \
-            pip install --target=./python --platform manylinux2014_x86_64 --python-version 3.11 --only-binary=:all: \
-              fastapi uvicorn pydantic email-validator cryptography dashscope httpx oss2
-          # akong-agent-base 装到 python/akong_agent_base (从 sibling clone 复制源码)
-          cp -r ../akong-agent-base/src/akong_agent_base ./python/
+      - uses: docker/setup-buildx-action@v3
 
-          # FC custom runtime · bootstrap (uvicorn 启 server)
-          cat > bootstrap <<'EOF'
-          #!/bin/bash
-          export PYTHONPATH=/code:/code/python:/code/src
-          exec /usr/bin/python3.11 -m uvicorn dayou_agent.server:app --host 0.0.0.0 --port 9000
-          EOF
-          chmod +x bootstrap
-          zip -rq fc-zip.zip bootstrap python src skills workspace pyproject.toml
-          ls -lh fc-zip.zip
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
 
-      - name: Upload ZIP to OSS
-        env:
-          OSS_AK: ${{ secrets.OSS_ACCESS_KEY_ID }}
-          OSS_SK: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
-        run: |
-          pip install --quiet oss2
-          python <<'EOF'
-          import os, oss2
-          auth = oss2.Auth(os.environ["OSS_AK"], os.environ["OSS_SK"])
-          bucket = oss2.Bucket(auth, "https://oss-cn-hangzhou.aliyuncs.com",
-                               os.environ.get("OSS_BUCKET", "agentaily-fc-zips"))
-          try: bucket.create_bucket()
-          except Exception: pass
-          key = f"mail-dayou-agent/{os.environ.get('GITHUB_SHA', 'main')[:8]}.zip"
-          bucket.put_object_from_file(key, "fc-zip.zip")
-          print(f"✓ uploaded oss://{bucket.bucket_name}/{key}")
-          with open(os.environ["GITHUB_ENV"], "a") as f: f.write(f"ZIP_KEY={key}\n")
-          EOF
+      - name: Build + Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Setup aliyun CLI
         run: |
@@ -85,26 +60,32 @@ jobs:
           tar -xzf /tmp/aliyun.tgz -C /tmp && sudo mv /tmp/aliyun /usr/local/bin/
           aliyun configure set --profile gha --mode AK \
             --region $REGION \
-            --access-key-id "${{ secrets.OSS_ACCESS_KEY_ID }}" \
-            --access-key-secret "${{ secrets.OSS_ACCESS_KEY_SECRET }}"
+            --access-key-id "${{ secrets.ALIYUN_AK }}" \
+            --access-key-secret "${{ secrets.ALIYUN_SK }}"
 
-      - name: Update FC v3 function code (从 OSS 拉 zip)
+      - name: Update FC v3 function (custom-container · ACR image)
+        env:
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          DAYOU_MASTER_KEY: ${{ secrets.DAYOU_MASTER_KEY }}
         run: |
+          IMAGE_VPC="${{ env.REGISTRY_VPC }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
           BODY=$(cat <<JSON
           {
             "functionName": "${FC_FUNCTION}",
-            "runtime": "custom.debian12",
-            "handler": "bootstrap",
+            "description": "${FC_FUNCTION} · ACR · 老板 5-7 切容器镜像",
+            "runtime": "custom-container",
+            "handler": "not-used",
             "timeout": 600,
             "memorySize": 512,
             "instanceConcurrency": 5,
-            "code": {
-              "ossBucketName": "${OSS_BUCKET}",
-              "ossObjectName": "${ZIP_KEY}"
+            "customContainerConfig": {
+              "image": "$IMAGE_VPC",
+              "port": 9000,
+              "healthCheckConfig": {"httpGetUrl": "/health", "initialDelaySeconds": 5}
             },
             "environmentVariables": {
-              "DAYOU_MASTER_KEY": "${{ secrets.DAYOU_MASTER_KEY }}",
-              "DASHSCOPE_API_KEY": "${{ secrets.DASHSCOPE_API_KEY }}",
+              "DASHSCOPE_API_KEY": "$DASHSCOPE_API_KEY",
+              "DAYOU_MASTER_KEY": "$DAYOU_MASTER_KEY",
               "AGENT_NAS_ROOT": "/mnt/nas/dayou",
               "AGENT_DB_NAME": "dayou.sqlite",
               "AGENT_USE_NAS": "1"
@@ -112,11 +93,14 @@ jobs:
           }
           JSON
           )
-          aliyun --profile gha fc PUT "/2023-03-30/functions/${FC_FUNCTION}" \
-            --header "Content-Type=application/json;" \
-            --body "$BODY" 2>&1 | tail -5
+          if ! aliyun --profile gha fc PUT "/2023-03-30/functions/${FC_FUNCTION}" \
+              --header "Content-Type=application/json;" --body "$BODY" 2>&1 | tee /tmp/fc.log | tail -5; then true; fi
+          if grep -q "FunctionNotFound\|can not find" /tmp/fc.log 2>/dev/null; then
+            aliyun --profile gha fc POST /2023-03-30/functions \
+              --header "Content-Type=application/json;" --body "$BODY" 2>&1 | tail -10
+          fi
 
       - name: Smoke
         run: |
-          sleep 5
+          sleep 10
           curl -fsSL "https://api.dayou.mail.agentaily.com/health?cb=$RANDOM" -w "\nHTTP %{http_code}\n" || true
