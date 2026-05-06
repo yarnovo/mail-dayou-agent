@@ -27,6 +27,7 @@ from pydantic import BaseModel, EmailStr, Field
 from . import db, imap_client, smtp_client
 from .crypto import encrypt, decrypt
 from .providers import guess_provider, PROVIDERS
+from .llm_chat import chat_turn
 
 
 app = FastAPI(title="mail-dayou-agent", version="0.1.0",
@@ -275,3 +276,25 @@ def mailbox_archive(req: ArchiveReq, x_user_id: str | None = Header(None)):
     )
     db.audit(user_id, "archive", req.slug, f"uid={req.uid} label={req.label}")
     return {"ok": ok}
+
+
+# ─── /api/chat · 全对话形态 (老板 5-6 拍 · 替表单) ──────────────────────
+
+
+class ChatReq(BaseModel):
+    messages: list[dict] = Field(..., description="[{role, content}] · 跟 OpenAI / qwen 同 schema")
+
+
+@app.post("/api/chat")
+def chat(req: ChatReq, x_user_id: str | None = Header(None)):
+    """跟 dayou 自然语言聊 · LLM 决定调啥 tool · 不要表单。
+
+    用户场景示例:
+    - "帮我挂个 Gmail" → LLM 引导对话获取 4 件 → 调 connect_mailbox
+    - "看下今早邮件" → 调 list_inbox · 摘要返回
+    - "回他确认下周二" → 调 draft_message · 返草稿 · 等用户说"发"再调 send_draft
+    """
+    user_id = require_user(x_user_id)
+    if not req.messages:
+        raise HTTPException(400, "messages 不能空")
+    return chat_turn(user_id, req.messages)

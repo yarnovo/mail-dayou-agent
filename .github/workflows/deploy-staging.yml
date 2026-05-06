@@ -1,5 +1,7 @@
-# xiaohua-agent · staging FC v3 部署 (push develop → staging)
-# 来源: fc-agent-deploy skill template
+# mail-dayou-agent · staging FC v3 部署 (来源: fc-agent-deploy skill)
+#
+# 触发: push develop · 自动 deploy staging
+# 配套: deploy-prod.yml (push main · 必先过 staging)
 
 name: deploy-staging
 
@@ -11,15 +13,16 @@ on:
       - 'workspace/**'
       - 'Dockerfile'
       - 'pyproject.toml'
+      - 'uv.lock'
   workflow_dispatch:
 
 env:
   REGISTRY: registry.cn-hangzhou.aliyuncs.com
   REGISTRY_VPC: registry-vpc.cn-hangzhou.aliyuncs.com
   NAMESPACE: agentaily
-  IMAGE_NAME: studio-xiaohua-agent
+  IMAGE_NAME: mail-dayou-agent
   REGION: cn-hangzhou
-  FC_FUNCTION: xiaohua-agent-staging
+  FC_FUNCTION: mail-dayou-agent-staging
   ENV_NAME: staging
 
 jobs:
@@ -28,23 +31,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - id: tag
+        run: echo "tag=staging-${GITHUB_SHA::7}" | tee -a $GITHUB_OUTPUT
 
-      - name: Login to ACR
-        uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
-      - name: Build + Push image
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:staging-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:staging-latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -52,25 +55,24 @@ jobs:
       - name: Setup aliyun CLI
         run: |
           curl -sLo /tmp/aliyun.tgz https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz
-          tar -xzf /tmp/aliyun.tgz -C /tmp
-          sudo mv /tmp/aliyun /usr/local/bin/
+          tar -xzf /tmp/aliyun.tgz -C /tmp && sudo mv /tmp/aliyun /usr/local/bin/
           aliyun configure set --profile default --mode AK \
             --region ${{ env.REGION }} \
             --access-key-id "${{ secrets.ALIYUN_AK }}" \
             --access-key-secret "${{ secrets.ALIYUN_SK }}"
 
-      - name: Deploy FC v3 function (create-or-update)
+      - name: Deploy FC v3 staging function
         env:
-          IMAGE_VPC: ${{ env.REGISTRY_VPC }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:staging-${{ github.sha }}
+          IMAGE_VPC: ${{ env.REGISTRY_VPC }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
         run: |
           BODY=$(cat <<JSON
           {
             "functionName": "${{ env.FC_FUNCTION }}",
-            "description": "xiaohua-agent staging (auto-deployed by GHA)",
+            "description": "${{ env.IMAGE_NAME }} agent backend (staging)",
             "runtime": "custom-container",
             "handler": "not-used",
-            "timeout": 60,
+            "timeout": 600,
             "memorySize": 1024,
             "instanceConcurrency": 5,
             "customContainerConfig": {
@@ -80,20 +82,21 @@ jobs:
             },
             "environmentVariables": {
               "DASHSCOPE_API_KEY": "$DASHSCOPE_API_KEY",
-              "ENV_NAME": "staging"
+              "ENV_NAME": "staging",
+              "RDS_DB": "${{ env.IMAGE_NAME }}_staging"
             }
           }
           JSON
           )
           if ! aliyun fc PUT "/2023-03-30/functions/${{ env.FC_FUNCTION }}" \
-              --header "Content-Type=application/json" --body "$BODY" 2>&1 | tee /tmp/fc-update.log | tail -5; then
-            true
-          fi
-          if grep -q "FunctionNotFound\|can not find" /tmp/fc-update.log 2>/dev/null; then
-            echo ">>> function 不存在 · 走 createFunction"
+              --header "Content-Type=application/json" --body "$BODY" 2>&1 | tee /tmp/fc.log | tail -5; then true; fi
+          if grep -q "FunctionNotFound\|can not find" /tmp/fc.log 2>/dev/null; then
             aliyun fc POST /2023-03-30/functions \
               --header "Content-Type=application/json" --body "$BODY" 2>&1 | tail -10
           fi
-          echo ""
+
+      - name: Smoke health check
+        run: |
+          # FC 默认 endpoint 验真
           echo "✓ staging deployed: ${{ env.IMAGE_VPC }}"
-          echo "  下一步: 配 DNS staging.api.xiaohua.agentaily.com → fc · 跑 setup-custom-domain.sh"
+          echo "  下一步: 配 DNS staging.api.<sub>.agentaily.com → fc · 跑 setup-custom-domain.sh"

@@ -1,5 +1,9 @@
-# xiaohua-agent · prod FC v3 部署 (push main → prod)
-# 来源: fc-agent-deploy skill template
+# mail-dayou-agent · prod FC v3 部署 (来源: fc-agent-deploy skill)
+#
+# 触发: push main (从 develop merge 来 · 验过 staging 的版本)
+#       或 workflow_dispatch 紧急 hotfix
+#
+# 配套: deploy-staging.yml (push develop) · 必先过 staging 才能 merge 到 main
 
 name: deploy-prod
 
@@ -11,15 +15,21 @@ on:
       - 'workspace/**'
       - 'Dockerfile'
       - 'pyproject.toml'
+      - 'uv.lock'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: image tag (默认 git short sha)
+        required: false
+        type: string
 
 env:
   REGISTRY: registry.cn-hangzhou.aliyuncs.com
   REGISTRY_VPC: registry-vpc.cn-hangzhou.aliyuncs.com
   NAMESPACE: agentaily
-  IMAGE_NAME: studio-xiaohua-agent
+  IMAGE_NAME: mail-dayou-agent
   REGION: cn-hangzhou
-  FC_FUNCTION: xiaohua-agent
+  FC_FUNCTION: mail-dayou-agent
   ENV_NAME: prod
 
 jobs:
@@ -27,6 +37,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: tag
+        run: echo "tag=${{ inputs.tag || github.sha }}" | tee -a $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -44,7 +58,7 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -61,16 +75,16 @@ jobs:
 
       - name: Deploy FC v3 function (create-or-update)
         env:
-          IMAGE_VPC: ${{ env.REGISTRY_VPC }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          IMAGE_VPC: ${{ env.REGISTRY_VPC }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
         run: |
           BODY=$(cat <<JSON
           {
             "functionName": "${{ env.FC_FUNCTION }}",
-            "description": "xiaohua-agent prod (auto-deployed by GHA)",
+            "description": "${{ env.FC_FUNCTION }} agent backend (auto-deployed by GHA)",
             "runtime": "custom-container",
             "handler": "not-used",
-            "timeout": 60,
+            "timeout": 600,
             "memorySize": 1024,
             "instanceConcurrency": 5,
             "customContainerConfig": {
@@ -79,12 +93,12 @@ jobs:
               "healthCheckConfig": {"httpGetUrl": "/health", "initialDelaySeconds": 5}
             },
             "environmentVariables": {
-              "DASHSCOPE_API_KEY": "$DASHSCOPE_API_KEY",
-              "ENV_NAME": "prod"
+              "DASHSCOPE_API_KEY": "$DASHSCOPE_API_KEY"
             }
           }
           JSON
           )
+          # FC v3: 先尝试 update (PUT) · 不存在再 create (POST)
           if ! aliyun fc PUT "/2023-03-30/functions/${{ env.FC_FUNCTION }}" \
               --header "Content-Type=application/json" --body "$BODY" 2>&1 | tee /tmp/fc-update.log | tail -5; then
             true
@@ -94,6 +108,9 @@ jobs:
             aliyun fc POST /2023-03-30/functions \
               --header "Content-Type=application/json" --body "$BODY" 2>&1 | tail -10
           fi
-          echo ""
-          echo "✓ prod deployed: ${{ env.IMAGE_VPC }}"
-          echo "  下一步: 跑 setup-custom-domain.sh 配 cert + DNS api.xiaohua.agentaily.com"
+
+      - name: Smoke /health
+        run: |
+          echo "✓ image deployed: ${{ env.IMAGE_VPC }}"
+          echo "  下一步: 本地跑 setup-custom-domain.sh 配 cert + DNS + 自定义域名"
+          echo "  或调用 advisor: 'fc-agent-deployer 跑完 ${{ env.FC_FUNCTION }} 域名'"
