@@ -2,7 +2,7 @@
 name = "mail-dayou-agent"
 version = "0.1.0"
 description = "阿空大邮 (邮箱管理大师) backend · multi-user IMAP/SMTP · FC v3 + NAS"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
   "akong-agent-base>=0.1.0",
   "fastapi>=0.115",
