@@ -1,0 +1,99 @@
+# xiaohua-agent · prod FC v3 部署 (push main → prod)
+# 来源: fc-agent-deploy skill template
+
+name: deploy-prod
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'workspace/**'
+      - 'Dockerfile'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  REGISTRY_VPC: registry-vpc.cn-hangzhou.aliyuncs.com
+  NAMESPACE: agentaily
+  IMAGE_NAME: studio-xiaohua-agent
+  REGION: cn-hangzhou
+  FC_FUNCTION: xiaohua-agent
+  ENV_NAME: prod
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build + Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Setup aliyun CLI
+        run: |
+          curl -sLo /tmp/aliyun.tgz https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz
+          tar -xzf /tmp/aliyun.tgz -C /tmp
+          sudo mv /tmp/aliyun /usr/local/bin/
+          aliyun configure set --profile default --mode AK \
+            --region ${{ env.REGION }} \
+            --access-key-id "${{ secrets.ALIYUN_AK }}" \
+            --access-key-secret "${{ secrets.ALIYUN_SK }}"
+
+      - name: Deploy FC v3 function (create-or-update)
+        env:
+          IMAGE_VPC: ${{ env.REGISTRY_VPC }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+        run: |
+          BODY=$(cat <<JSON
+          {
+            "functionName": "${{ env.FC_FUNCTION }}",
+            "description": "xiaohua-agent prod (auto-deployed by GHA)",
+            "runtime": "custom-container",
+            "handler": "not-used",
+            "timeout": 60,
+            "memorySize": 1024,
+            "instanceConcurrency": 5,
+            "customContainerConfig": {
+              "image": "${{ env.IMAGE_VPC }}",
+              "port": 9000,
+              "healthCheckConfig": {"httpGetUrl": "/health", "initialDelaySeconds": 5}
+            },
+            "environmentVariables": {
+              "DASHSCOPE_API_KEY": "$DASHSCOPE_API_KEY",
+              "ENV_NAME": "prod"
+            }
+          }
+          JSON
+          )
+          if ! aliyun fc PUT "/2023-03-30/functions/${{ env.FC_FUNCTION }}" \
+              --header "Content-Type=application/json" --body "$BODY" 2>&1 | tee /tmp/fc-update.log | tail -5; then
+            true
+          fi
+          if grep -q "FunctionNotFound\|can not find" /tmp/fc-update.log 2>/dev/null; then
+            echo ">>> function 不存在 · 走 createFunction"
+            aliyun fc POST /2023-03-30/functions \
+              --header "Content-Type=application/json" --body "$BODY" 2>&1 | tail -10
+          fi
+          echo ""
+          echo "✓ prod deployed: ${{ env.IMAGE_VPC }}"
+          echo "  下一步: 跑 setup-custom-domain.sh 配 cert + DNS api.xiaohua.agentaily.com"

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://vault-cli.local/schemas/v3/vault-manifest.schema.json",
+  "project": "mail-dayou-agent",
+  "credentials": {
+    "dashscope-main": {
+      "slug": "dashscope-main",
+      "fields": ["api_key"],
+      "env": {
+        "api_key": "DASHSCOPE_API_KEY"
+      },
+      "purpose": "通义万相 wanx2.1-t2i-turbo 文生图 · 帮用户生头像 · 跟 CosyVoice TTS 共享 quota"
+    }
+  }
+}
