@@ -1,0 +1,109 @@
+name: deploy
+# FC v3 Custom Runtime · ZIP 部署 (老板 5-2 拍省钱简化 · 不用 docker · 不用 ACR)
+#
+# 流程: pip install --target=python/ → zip 整 src + python deps → OSS → FC 拉 zip
+# 凭证只要 OSS_AK + OSS_SK (跟 intro 仓共用 · 已有)
+#
+# 跑前置: 一次性 setup FC service + function (用 aliyun cli 创建 · 见 setup-fc.md wiki)
+#         首次跑会失败 · 失败时建函数后再 retry
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "workspace/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+env:
+  REGION: cn-hangzhou
+  FC_FUNCTION: mail-dayou-agent
+  OSS_BUCKET: agentaily-fc-zips
+  ACCOUNT_ID: "1577573550634833"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+
+      - name: 打 ZIP (src/ + workspace/ + pip 装依赖到 python/)
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install --quiet uv
+          uv pip install --target=./python -r <(uv pip compile pyproject.toml 2>/dev/null) || \
+            pip install --target=./python fastapi uvicorn pydantic email-validator cryptography dashscope httpx oss2 requests
+          # FC custom runtime python: bootstrap script
+          cat > bootstrap <<'EOF'
+          #!/bin/bash
+          export PYTHONPATH=/code:/code/python:/code/src
+          exec python -m uvicorn dayou_agent.server:app --host 0.0.0.0 --port 9000
+          EOF
+          chmod +x bootstrap
+          zip -rq fc-zip.zip bootstrap python src workspace pyproject.toml
+          ls -la fc-zip.zip
+
+      - name: Upload ZIP to OSS
+        env:
+          OSS_AK: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_SK: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        run: |
+          pip install --quiet oss2
+          python <<'EOF'
+          import os, oss2
+          auth = oss2.Auth(os.environ["OSS_AK"], os.environ["OSS_SK"])
+          bucket = oss2.Bucket(auth, "https://oss-cn-hangzhou.aliyuncs.com", os.environ.get("OSS_BUCKET", "agentaily-fc-zips"))
+          # bucket 不存在自动建
+          try: bucket.create_bucket()
+          except: pass
+          key = f"mail-dayou-agent/{os.environ.get('GITHUB_SHA', 'main')[:8]}.zip"
+          bucket.put_object_from_file(key, "fc-zip.zip")
+          print(f"✓ uploaded oss://{bucket.bucket_name}/{key}")
+          print(f"::set-output name=zip_key::{key}")
+          EOF
+
+      - name: Update FC v3 function code (从 OSS 拉 zip)
+        env:
+          OSS_BUCKET: agentaily-fc-zips
+        run: |
+          aliyun configure set --profile gha \
+            --mode AK \
+            --region $REGION \
+            --access-key-id ${{ secrets.OSS_ACCESS_KEY_ID }} \
+            --access-key-secret ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          # 用 PUT /functions/<name> 更新 code · zip 从 OSS 拉
+          ZIP_KEY="mail-dayou-agent/${GITHUB_SHA:0:8}.zip"
+          BODY=$(cat <<JSON
+          {
+            "functionName": "${FC_FUNCTION}",
+            "runtime": "custom.debian10",
+            "handler": "index.handler",
+            "code": {
+              "ossBucketName": "${OSS_BUCKET}",
+              "ossObjectName": "${ZIP_KEY}"
+            },
+            "memorySize": 512,
+            "timeout": 60,
+            "environmentVariables": {
+              "DAYOU_MASTER_KEY": "${{ secrets.DAYOU_MASTER_KEY }}",
+              "DASHSCOPE_API_KEY": "${{ secrets.DASHSCOPE_API_KEY }}"
+            }
+          }
+          JSON
+          )
+          aliyun --profile gha fc PUT "/2023-03-30/functions/${FC_FUNCTION}" \
+            --header "Content-Type=application/json;" \
+            --body "$BODY" 2>&1 | tail -5
+
+      - name: Smoke
+        run: |
+          sleep 5
+          curl -fsSL "https://api.dayou.mail.agentaily.com/health?cb=$RANDOM" -w "\nHTTP %{http_code}\n" || true
