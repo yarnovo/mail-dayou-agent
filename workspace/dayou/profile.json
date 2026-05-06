@@ -11,11 +11,11 @@
     "style": "dicebear-notionists"
   },
   "voice": {
-    "provider": "alibaba-cosyvoice-v2",
-    "model": "cosyvoice-v2",
-    "slug": "longshu_v2",
-    "voice_zh": "沉稳成熟男",
-    "rationale": "邮箱托管 · 资深秘书腔 · 谨慎 · 不撒娇 · 让用户敢托付邮箱"
+    "provider": "minimax-speech-02-hd",
+    "model": "speech-02-hd",
+    "slug": "male-qn-jingying",
+    "voice_zh": "精英青年男 · 沉稳商务",
+    "rationale": "邮箱托管 · 资深秘书腔 · MiniMax 中文多音字更准 (老板 5-6 拍替 CosyVoice 把 yǒng 读 yōng)"
   },
   "accent": "#0f172a",
   "background": {
