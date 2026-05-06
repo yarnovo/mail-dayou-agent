@@ -27,9 +27,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python 3.13
+      - name: Setup Python 3.11 (跟 FC custom.debian12 内置 python3.11 一致)
         uses: actions/setup-python@v5
-        with: { python-version: "3.13" }
+        with: { python-version: "3.11" }
 
       - name: Clone akong-agent-base (sibling · pyproject [tool.uv.sources] 引)
         run: |
@@ -43,8 +43,8 @@ jobs:
           set -e
           pip install --quiet uv
           # uv 解析 [tool.uv.sources] · akong-agent-base 走 ../akong-agent-base
-          uv pip install --target=./python --python-platform x86_64-manylinux2014 -r <(uv pip compile pyproject.toml) || \
-            pip install --target=./python --platform manylinux2014_x86_64 --only-binary=:all: \
+          uv pip install --target=./python --python-platform x86_64-manylinux2014 --python-version 3.11 -r <(uv pip compile pyproject.toml --python-version 3.11) || \
+            pip install --target=./python --platform manylinux2014_x86_64 --python-version 3.11 --only-binary=:all: \
               fastapi uvicorn pydantic email-validator cryptography dashscope httpx oss2
           # akong-agent-base 装到 python/akong_agent_base (从 sibling clone 复制源码)
           cp -r ../akong-agent-base/src/akong_agent_base ./python/
