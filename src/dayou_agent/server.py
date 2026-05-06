@@ -1,33 +1,51 @@
 """阿空大邮 (mail-dayou) FastAPI · multi-user IMAP/SMTP 邮箱管理。
 
-通用部分走 akong-agent-base (db / chat_store / middleware / LLMRunner / register_chat_routes)。
-本仓只管 dayou-specific endpoint:
-- /api/providers/* (邮箱服务商查询)
-- /api/mailbox/* (挂邮箱 / 列 / 读 / 草稿 / 发 / 归档)
-- crypto.py (本地保留 · 老 dayou-user-key-v1 info 兼容老 app_password_enc 数据)
+通用部分走 akong-agent-base v0.2 (db / chat_store / middleware / LLMRunner / register_chat_routes / Skill)。
+本仓只管 dayou-specific:
+- crypto.py (info=dayou-user-key-v1 · 兼容老 app_password_enc · 不用 lib crypto)
+- providers / imap_client / smtp_client (邮箱业务)
+- skills/mailbox/ (skill 文件夹 · 7 个 tool · LLMRunner discover 加载)
 
-通用 chat endpoint (POST /api/chat / GET /api/chat/history / POST /api/chat/topic-break)
-由 lib 的 register_chat_routes 自动挂。
+agent 启动:
+  skills = discover_skills(repo_root / "skills")
+  runner = LLMRunner(skills=skills, base_prompt_loader=load_persona)
 
-部署 env (deploy.yml 里设):
-- AGENT_NAS_ROOT=/mnt/nas/dayou  (跟现 prod NAS 一致 · 不丢数据)
-- AGENT_DB_NAME=dayou.sqlite     (跟现 prod sqlite 文件一致)
-- AGENT_USE_NAS=1                (FC instance 强用 NAS 路径)
+部署 env (deploy.yml):
+- AGENT_NAS_ROOT=/mnt/nas/dayou
+- AGENT_DB_NAME=dayou.sqlite
+- AGENT_USE_NAS=1
 """
 from __future__ import annotations
+from pathlib import Path
+
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 
-from akong_agent_base import LLMRunner, register_chat_routes, require_user
+from akong_agent_base import LLMRunner, register_chat_routes, require_user, discover_skills
 
-from . import db, imap_client, smtp_client, llm_chat
+from . import db, imap_client, smtp_client
 from .crypto import encrypt, decrypt
 from .providers import guess_provider, PROVIDERS
 
 
-app = FastAPI(title="mail-dayou-agent", version="0.2.0",
-              description="阿空大邮 · multi-user 邮箱管理 (IMAP + SMTP) · 用 akong-agent-base lib")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WORKSPACE = REPO_ROOT / "workspace" / "dayou"
+SKILLS_DIR = REPO_ROOT / "skills"
+
+
+def _load_persona() -> str:
+    """读 workspace/dayou/IDENTITY.md + SOUL.md · 拼基础 prompt (skill prompts 由 LLMRunner 自动 append)."""
+    parts = ["你是阿空大邮 (邮箱管理大师) · 帮用户管他自己的邮箱。\n"]
+    for name in ("IDENTITY.md", "SOUL.md"):
+        p = WORKSPACE / name
+        if p.exists():
+            parts.append(p.read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
+
+app = FastAPI(title="mail-dayou-agent", version="0.3.0",
+              description="阿空大邮 · multi-user 邮箱管理 · 用 akong-agent-base v0.2 skill 系统")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,27 +63,27 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup():
-    db.init()  # 通用 chat 表 (lib) + dayou-specific 两表 (mailbox_accounts + drafts)
+    db.init()  # 通用 chat schema (lib) + dayou 表 (mailbox_accounts + drafts)
 
 
-# ─── chat endpoint (lib 自动挂 3 个) ────────────────────────────────────
+# ─── chat endpoint (lib 自动挂 3 个 · 用 skill driven LLMRunner) ──────────
 
 _runner = LLMRunner(
-    tools=llm_chat.TOOLS,
-    tool_impls=llm_chat.TOOL_IMPLS,
-    system_prompt_loader=llm_chat.load_system_prompt,
-    dashscope_key_resolver=llm_chat.resolve_dashscope_key,
+    skills=discover_skills(SKILLS_DIR),
+    base_prompt_loader=_load_persona,
     model="deepseek-v4-pro",
 )
 register_chat_routes(app, _runner)  # POST /api/chat · GET /api/chat/history · POST /api/chat/topic-break
 
 
-# ─── 健康 + providers ─────────────────────────────────────────────────
-
-
 @app.get("/health")
 def health():
-    return {"status": "ok", "agent": "dayou", "version": "0.2.0", "multi_user": True, "lib": "akong-agent-base"}
+    skill_names = [s.name for s in _runner.skills]
+    return {
+        "status": "ok", "agent": "dayou", "version": "0.3.0",
+        "multi_user": True, "lib": "akong-agent-base@0.2.0",
+        "skills": skill_names,
+    }
 
 
 @app.get("/api/providers/guess")
@@ -92,7 +110,7 @@ def providers_list():
     ]
 
 
-# ─── mailbox endpoints (dayou-specific · 用 lib require_user) ────────────
+# ─── mailbox endpoints (dayou-specific REST · 跟 skill tool 平行 · 给前端直调) ──
 
 
 class ConnectReq(BaseModel):

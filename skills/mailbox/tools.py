@@ -1,55 +1,16 @@
-"""dayou-specific TOOLS + TOOL_IMPLS + system prompt loader · 给 LLMRunner 喂。
+"""mail-dayou mailbox skill · 7 tools (guess/connect/list/read/draft/send/archive)。
 
-通用 tool calling 主循环 (chat_turn) 在 akong_agent_base.LLMRunner · 本文件只管 dayou 业务:
-- 7 个邮箱 tool 定义 (function calling JSON)
-- 7 个 tool 实现 (per user_id 隔离 · 走 imap/smtp 业务)
-- 系统提示词加载 (workspace/dayou/SOUL.md + IDENTITY.md)
+import 走 dayou_agent 包 (本 skill 是 mail-dayou-agent 仓内的 · 不是独立仓)。
+LLMRunner 加载 skill 时执行此文件 · TOOLS + TOOL_IMPLS 模块级变量被读。
 """
 from __future__ import annotations
-import json
-import os
-from pathlib import Path
 
-from . import db, imap_client, smtp_client
-from .crypto import encrypt, decrypt
-from .providers import guess_provider
+from dayou_agent import db, imap_client, smtp_client
+from dayou_agent.crypto import encrypt, decrypt
+from dayou_agent.providers import guess_provider
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-WORKSPACE = REPO_ROOT / "workspace" / "dayou"
-
-
-def load_system_prompt() -> str:
-    """读 IDENTITY + SOUL · 拼成 system prompt (LLMRunner 每次 chat_turn 调一次)."""
-    parts = ["你是阿空大邮 (邮箱管理大师) · 帮用户管他自己的邮箱。\n"]
-    for name in ("IDENTITY.md", "SOUL.md"):
-        p = WORKSPACE / name
-        if p.exists():
-            parts.append(p.read_text(encoding="utf-8"))
-    parts.append("""
-关键规则 (必守):
-- 永远不自动回信 · 任何对外发信都先草稿 + 等用户说"发"才调 send_draft
-- 永远不删信 · 只能 archive_message (打 label · 不真删)
-- 用户说"挂邮箱" → 引导他给 4 件: 邮箱地址 / 服务器 (你能从域名自动判断 · 见 guess_provider) / 应用专用密码 / 昵称(slug)
-- 强制应用专用密码 · 拒绝主密码
-- 用户给的密码 · 你立刻调 connect_mailbox · 验证通过才确认挂上
-- 用 tool 时直接调 · 不要解释你要调啥 (用户不关心)
-""")
-    return "\n".join(parts)
-
-
-def resolve_dashscope_key() -> str:
-    if k := os.getenv("DASHSCOPE_API_KEY"):
-        return k
-    secrets_path = REPO_ROOT / ".vault" / "secrets.json"
-    if secrets_path.exists():
-        d = json.loads(secrets_path.read_text())
-        if k := d.get("dashscope-main", {}).get("api_key"):
-            return k
-    raise RuntimeError("DASHSCOPE_API_KEY 没配 · 走 env 或 .vault/secrets.json::dashscope-main.api_key")
-
-
-# ─── Tools 定义 (function calling JSON · LLMRunner 透传) ────────────────────
+# ─── Tools 定义 (function calling JSON · LLMRunner 透传给 LLM) ─────────
 
 TOOLS = [
     {
@@ -157,7 +118,7 @@ TOOLS = [
 ]
 
 
-# ─── tool 实现 (per user_id 隔离 · 调 imap/smtp + sqlite) ────────────────
+# ─── tool 实现 (per user_id 隔离 · 调 imap/smtp + sqlite) ────────────
 
 
 def _load_account(user_id: str, slug: str) -> dict | None:

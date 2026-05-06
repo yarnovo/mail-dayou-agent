@@ -9,6 +9,7 @@ on:
     branches: [main]
     paths:
       - "src/**"
+      - "skills/**"
       - "pyproject.toml"
       - "uv.lock"
       - "workspace/**"
@@ -31,11 +32,11 @@ jobs:
         uses: actions/setup-python@v5
         with: { python-version: "3.11" }
 
-      - name: Clone akong-agent-base (sibling · pyproject [tool.uv.sources] 引)
+      - name: Clone akong-agent-base v0.2 (sibling · pyproject [tool.uv.sources] 引)
         run: |
           cd ..
           rm -rf akong-agent-base
-          git clone --depth 1 https://github.com/yarnovo/akong-agent-base.git
+          git clone --depth 1 --branch v0.2.0 https://github.com/yarnovo/akong-agent-base.git
           ls akong-agent-base/
 
       - name: 打 ZIP (src + workspace + pip 装依赖到 python/)
@@ -56,7 +57,7 @@ jobs:
           exec /usr/bin/python3.11 -m uvicorn dayou_agent.server:app --host 0.0.0.0 --port 9000
           EOF
           chmod +x bootstrap
-          zip -rq fc-zip.zip bootstrap python src workspace pyproject.toml
+          zip -rq fc-zip.zip bootstrap python src skills workspace pyproject.toml
           ls -lh fc-zip.zip
 
       - name: Upload ZIP to OSS
