@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "阿空大邮 (邮箱管理大师) backend · multi-user IMAP/SMTP · FC v3 + NAS"
 requires-python = ">=3.13"
 dependencies = [
+  "akong-agent-base>=0.1.0",
   "fastapi>=0.115",
   "uvicorn[standard]>=0.32",
   "pydantic>=2.0",
@@ -11,6 +12,10 @@ dependencies = [
   "dashscope>=1.20",
   "email-validator>=2.3.0",
 ]
+
+[tool.uv.sources]
+# 本地 dev: 相对路径 link · GHA build 也走这条 (akong-agent-base 跟 mail-dayou-agent 平级)
+akong-agent-base = { path = "../akong-agent-base" }
 
 [build-system]
 requires = ["hatchling"]
