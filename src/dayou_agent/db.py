@@ -1,108 +1,54 @@
-"""SQLite per FC instance · WAL 模式 · path 走 NAS /mnt/nas/dayou/dayou.sqlite。
+"""dayou-specific schema (mailbox_accounts + drafts) · 通用部分用 akong-agent-base.db。
 
-v0.1: 1 FC instance + WAL 扛并发 (per-user 操作串行 · 用户间 ok)
-v0.2: 拆 RDS · API 不破
+通用 chat_messages / chat_summaries / audit_log → lib 自动建。
+本文件只管 dayou 自己的两表 · server.py 启动调 init() 一次。
 
-per-user 路径隔离:
-- 草稿附件 → /mnt/nas/dayou/users/<user_id>/drafts/
-- 邮件 cache → 不持久化 (memory only · LLM call 完丢)
+env (设在 deploy.yml · GHA 注入到 FC):
+- AGENT_NAS_ROOT=/mnt/nas/dayou  · 跟现 prod NAS 路径一致
+- AGENT_DB_NAME=dayou.sqlite     · 跟现 prod sqlite 文件一致
 """
 from __future__ import annotations
-import os
-import sqlite3
-import time
-from contextlib import contextmanager
-from pathlib import Path
+
+# re-export lib API 让旧 import (db.conn / db.now_ts / db.audit) 不破
+from akong_agent_base.db import conn, now_ts, audit, init as _lib_init, exec_script  # noqa: F401
 
 
-def _db_path() -> Path:
-    """NAS 优先 · 本地 dev fallback ~/.dayou/dayou.sqlite。"""
-    nas = os.environ.get("DAYOU_NAS_ROOT", "/mnt/nas/dayou")
-    nas_path = Path(nas)
-    if nas_path.exists() or os.environ.get("DAYOU_USE_NAS") == "1":
-        nas_path.mkdir(parents=True, exist_ok=True)
-        return nas_path / "dayou.sqlite"
-    # dev fallback
-    home = Path.home() / ".dayou"
-    home.mkdir(parents=True, exist_ok=True)
-    return home / "dayou.sqlite"
+DAYOU_SCHEMA = """
+-- dayou-specific: 用户挂的 IMAP/SMTP 凭证 (Fernet 加密)
+CREATE TABLE IF NOT EXISTS mailbox_accounts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT NOT NULL,
+    slug            TEXT NOT NULL,
+    email           TEXT NOT NULL,
+    server_imap     TEXT NOT NULL,
+    port_imap       INTEGER NOT NULL,
+    server_smtp     TEXT NOT NULL,
+    port_smtp       INTEGER NOT NULL,
+    app_password_enc TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    UNIQUE(user_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_accounts_user ON mailbox_accounts(user_id);
+
+-- dayou-specific: 待发草稿
+CREATE TABLE IF NOT EXISTS drafts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT NOT NULL,
+    account_slug    TEXT NOT NULL,
+    to_addr         TEXT NOT NULL,
+    cc_addr         TEXT,
+    subject         TEXT NOT NULL,
+    body            TEXT NOT NULL,
+    in_reply_to     TEXT,
+    created_at      INTEGER NOT NULL,
+    sent_at         INTEGER,
+    sent_msg_id     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_drafts_user ON drafts(user_id);
+"""
 
 
-_DB_PATH: Path | None = None
-
-
-def db_path() -> Path:
-    global _DB_PATH
-    if _DB_PATH is None:
-        _DB_PATH = _db_path()
-    return _DB_PATH
-
-
-@contextmanager
-def conn():
-    c = sqlite3.connect(db_path(), isolation_level=None)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA synchronous=NORMAL")
-    c.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield c
-    finally:
-        c.close()
-
-
-def init():
-    """启动调一次 · 幂等。"""
-    with conn() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS mailbox_accounts (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id         TEXT NOT NULL,
-            slug            TEXT NOT NULL,
-            email           TEXT NOT NULL,
-            server_imap     TEXT NOT NULL,
-            port_imap       INTEGER NOT NULL,
-            server_smtp     TEXT NOT NULL,
-            port_smtp       INTEGER NOT NULL,
-            app_password_enc TEXT NOT NULL,
-            created_at      INTEGER NOT NULL,
-            UNIQUE(user_id, slug)
-        );
-        CREATE INDEX IF NOT EXISTS idx_accounts_user ON mailbox_accounts(user_id);
-
-        CREATE TABLE IF NOT EXISTS drafts (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id         TEXT NOT NULL,
-            account_slug    TEXT NOT NULL,
-            to_addr         TEXT NOT NULL,
-            cc_addr         TEXT,
-            subject         TEXT NOT NULL,
-            body            TEXT NOT NULL,
-            in_reply_to     TEXT,
-            created_at      INTEGER NOT NULL,
-            sent_at         INTEGER,
-            sent_msg_id     TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_drafts_user ON drafts(user_id);
-
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id         TEXT NOT NULL,
-            action          TEXT NOT NULL,
-            slug            TEXT,
-            detail          TEXT,
-            created_at      INTEGER NOT NULL
-        );
-        """)
-
-
-def now_ts() -> int:
-    return int(time.time())
-
-
-def audit(user_id: str, action: str, slug: str | None = None, detail: str | None = None):
-    with conn() as c:
-        c.execute(
-            "INSERT INTO audit_log(user_id, action, slug, detail, created_at) VALUES (?,?,?,?,?)",
-            (user_id, action, slug, detail, now_ts()),
-        )
+def init() -> None:
+    """启动一次 · 幂等。先建通用表 (lib) · 再加 dayou 表。"""
+    _lib_init()
+    exec_script(DAYOU_SCHEMA)

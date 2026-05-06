@@ -1,37 +1,33 @@
 """阿空大邮 (mail-dayou) FastAPI · multi-user IMAP/SMTP 邮箱管理。
 
-多用户隔离:
-- 每 request 必带 X-User-ID header
-- middleware 拒绝无 user_id 请求 (401)
-- 凭证 Fernet 加密 (per-user derived key) 存 sqlite
-- per-user 文件路径 /mnt/nas/dayou/users/<user_id>/
+通用部分走 akong-agent-base (db / chat_store / middleware / LLMRunner / register_chat_routes)。
+本仓只管 dayou-specific endpoint:
+- /api/providers/* (邮箱服务商查询)
+- /api/mailbox/* (挂邮箱 / 列 / 读 / 草稿 / 发 / 归档)
+- crypto.py (本地保留 · 老 dayou-user-key-v1 info 兼容老 app_password_enc 数据)
 
-API:
-- GET  /health
-- GET  /api/providers/guess?email=you@gmail.com
-- GET  /api/providers/list
-- POST /api/mailbox/connect
-- GET  /api/mailbox/accounts
-- POST /api/mailbox/list
-- POST /api/mailbox/read
-- POST /api/mailbox/draft
-- POST /api/mailbox/send  (强制 user_confirmed=true)
-- POST /api/mailbox/archive
-- DELETE /api/mailbox/account
+通用 chat endpoint (POST /api/chat / GET /api/chat/history / POST /api/chat/topic-break)
+由 lib 的 register_chat_routes 自动挂。
+
+部署 env (deploy.yml 里设):
+- AGENT_NAS_ROOT=/mnt/nas/dayou  (跟现 prod NAS 一致 · 不丢数据)
+- AGENT_DB_NAME=dayou.sqlite     (跟现 prod sqlite 文件一致)
+- AGENT_USE_NAS=1                (FC instance 强用 NAS 路径)
 """
 from __future__ import annotations
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 
-from . import db, imap_client, smtp_client
+from akong_agent_base import LLMRunner, register_chat_routes, require_user
+
+from . import db, imap_client, smtp_client, llm_chat
 from .crypto import encrypt, decrypt
 from .providers import guess_provider, PROVIDERS
-from .llm_chat import chat_turn
 
 
-app = FastAPI(title="mail-dayou-agent", version="0.1.0",
-              description="阿空大邮 · multi-user 邮箱管理 (IMAP + SMTP)")
+app = FastAPI(title="mail-dayou-agent", version="0.2.0",
+              description="阿空大邮 · multi-user 邮箱管理 (IMAP + SMTP) · 用 akong-agent-base lib")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,18 +45,27 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup():
-    db.init()
+    db.init()  # 通用 chat 表 (lib) + dayou-specific 两表 (mailbox_accounts + drafts)
 
 
-def require_user(x_user_id: str | None) -> str:
-    if not x_user_id or len(x_user_id) < 8:
-        raise HTTPException(401, "X-User-ID header missing or invalid (≥8 chars)")
-    return x_user_id
+# ─── chat endpoint (lib 自动挂 3 个) ────────────────────────────────────
+
+_runner = LLMRunner(
+    tools=llm_chat.TOOLS,
+    tool_impls=llm_chat.TOOL_IMPLS,
+    system_prompt_loader=llm_chat.load_system_prompt,
+    dashscope_key_resolver=llm_chat.resolve_dashscope_key,
+    model="deepseek-v4-pro",
+)
+register_chat_routes(app, _runner)  # POST /api/chat · GET /api/chat/history · POST /api/chat/topic-break
+
+
+# ─── 健康 + providers ─────────────────────────────────────────────────
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "agent": "dayou", "version": "0.1.0", "multi_user": True}
+    return {"status": "ok", "agent": "dayou", "version": "0.2.0", "multi_user": True, "lib": "akong-agent-base"}
 
 
 @app.get("/api/providers/guess")
@@ -87,6 +92,9 @@ def providers_list():
     ]
 
 
+# ─── mailbox endpoints (dayou-specific · 用 lib require_user) ────────────
+
+
 class ConnectReq(BaseModel):
     slug: str = Field(..., min_length=1, max_length=32, pattern=r"^[a-zA-Z0-9_-]+$")
     email: EmailStr
@@ -98,8 +106,7 @@ class ConnectReq(BaseModel):
 
 
 @app.post("/api/mailbox/connect")
-def mailbox_connect(req: ConnectReq, x_user_id: str | None = Header(None)):
-    user_id = require_user(x_user_id)
+def mailbox_connect(req: ConnectReq, user_id: str = Depends(require_user)):
     ok, msg = imap_client.verify_credentials(
         req.server_imap, req.port_imap, str(req.email), req.app_password
     )
@@ -124,8 +131,7 @@ def mailbox_connect(req: ConnectReq, x_user_id: str | None = Header(None)):
 
 
 @app.get("/api/mailbox/accounts")
-def mailbox_accounts(x_user_id: str | None = Header(None)):
-    user_id = require_user(x_user_id)
+def mailbox_accounts(user_id: str = Depends(require_user)):
     with db.conn() as c:
         rows = c.execute(
             "SELECT slug, email, server_imap, server_smtp, created_at FROM mailbox_accounts WHERE user_id=? ORDER BY created_at",
@@ -136,8 +142,7 @@ def mailbox_accounts(x_user_id: str | None = Header(None)):
 
 
 @app.delete("/api/mailbox/account")
-def mailbox_account_delete(slug: str, x_user_id: str | None = Header(None)):
-    user_id = require_user(x_user_id)
+def mailbox_account_delete(slug: str, user_id: str = Depends(require_user)):
     with db.conn() as c:
         cur = c.execute("DELETE FROM mailbox_accounts WHERE user_id=? AND slug=?", (user_id, slug))
         if cur.rowcount == 0:
@@ -170,8 +175,7 @@ class ListReq(BaseModel):
 
 
 @app.post("/api/mailbox/list")
-def mailbox_list(req: ListReq, x_user_id: str | None = Header(None)):
-    user_id = require_user(x_user_id)
+def mailbox_list(req: ListReq, user_id: str = Depends(require_user)):
     a = _load_account(user_id, req.slug)
     headers = imap_client.list_inbox(
         a["server_imap"], a["port_imap"], a["email"], a["password"],
@@ -188,8 +192,7 @@ class ReadReq(BaseModel):
 
 
 @app.post("/api/mailbox/read")
-def mailbox_read(req: ReadReq, x_user_id: str | None = Header(None)):
-    user_id = require_user(x_user_id)
+def mailbox_read(req: ReadReq, user_id: str = Depends(require_user)):
     a = _load_account(user_id, req.slug)
     msg = imap_client.read_message(
         a["server_imap"], a["port_imap"], a["email"], a["password"], uid=req.uid,
@@ -209,8 +212,7 @@ class DraftReq(BaseModel):
 
 
 @app.post("/api/mailbox/draft")
-def mailbox_draft(req: DraftReq, x_user_id: str | None = Header(None)):
-    user_id = require_user(x_user_id)
+def mailbox_draft(req: DraftReq, user_id: str = Depends(require_user)):
     _load_account(user_id, req.slug)
     with db.conn() as c:
         cur = c.execute(
@@ -232,8 +234,7 @@ class SendReq(BaseModel):
 
 
 @app.post("/api/mailbox/send")
-def mailbox_send(req: SendReq, x_user_id: str | None = Header(None)):
-    user_id = require_user(x_user_id)
+def mailbox_send(req: SendReq, user_id: str = Depends(require_user)):
     if not req.user_confirmed:
         raise HTTPException(400, "must explicitly set user_confirmed=true (硬规则 · 不自动发)")
     with db.conn() as c:
@@ -267,8 +268,7 @@ class ArchiveReq(BaseModel):
 
 
 @app.post("/api/mailbox/archive")
-def mailbox_archive(req: ArchiveReq, x_user_id: str | None = Header(None)):
-    user_id = require_user(x_user_id)
+def mailbox_archive(req: ArchiveReq, user_id: str = Depends(require_user)):
     a = _load_account(user_id, req.slug)
     ok = imap_client.archive(
         a["server_imap"], a["port_imap"], a["email"], a["password"],
@@ -276,25 +276,3 @@ def mailbox_archive(req: ArchiveReq, x_user_id: str | None = Header(None)):
     )
     db.audit(user_id, "archive", req.slug, f"uid={req.uid} label={req.label}")
     return {"ok": ok}
-
-
-# ─── /api/chat · 全对话形态 (老板 5-6 拍 · 替表单) ──────────────────────
-
-
-class ChatReq(BaseModel):
-    messages: list[dict] = Field(..., description="[{role, content}] · 跟 OpenAI / qwen 同 schema")
-
-
-@app.post("/api/chat")
-def chat(req: ChatReq, x_user_id: str | None = Header(None)):
-    """跟 dayou 自然语言聊 · LLM 决定调啥 tool · 不要表单。
-
-    用户场景示例:
-    - "帮我挂个 Gmail" → LLM 引导对话获取 4 件 → 调 connect_mailbox
-    - "看下今早邮件" → 调 list_inbox · 摘要返回
-    - "回他确认下周二" → 调 draft_message · 返草稿 · 等用户说"发"再调 send_draft
-    """
-    user_id = require_user(x_user_id)
-    if not req.messages:
-        raise HTTPException(400, "messages 不能空")
-    return chat_turn(user_id, req.messages)

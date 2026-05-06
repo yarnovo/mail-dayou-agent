@@ -1,19 +1,14 @@
-"""LLM chat endpoint · qwen-plus tool calling · dayou 全对话形态。
+"""dayou-specific TOOLS + TOOL_IMPLS + system prompt loader · 给 LLMRunner 喂。
 
-设计:
-- 用户跟 dayou 聊 · LLM 决定调啥 tool (connect/list/read/draft/send/archive)
-- 多轮对话 · LLM 增量收集 args (邮箱地址 → 应用密码 → 自动调 connect_mailbox)
-- 草稿先给用户看 · 用户说"发"才真发 · 跟 SOUL.md 一致
-
-system prompt 来自 workspace/dayou/SOUL.md + IDENTITY.md (沉稳秘书腔 · 不替用户拍 · 永远不自动回)。
+通用 tool calling 主循环 (chat_turn) 在 akong_agent_base.LLMRunner · 本文件只管 dayou 业务:
+- 7 个邮箱 tool 定义 (function calling JSON)
+- 7 个 tool 实现 (per user_id 隔离 · 走 imap/smtp 业务)
+- 系统提示词加载 (workspace/dayou/SOUL.md + IDENTITY.md)
 """
 from __future__ import annotations
 import json
 import os
 from pathlib import Path
-
-import dashscope
-from dashscope import Generation
 
 from . import db, imap_client, smtp_client
 from .crypto import encrypt, decrypt
@@ -24,8 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKSPACE = REPO_ROOT / "workspace" / "dayou"
 
 
-def _load_system_prompt() -> str:
-    """读 IDENTITY + SOUL · 拼成 system prompt."""
+def load_system_prompt() -> str:
+    """读 IDENTITY + SOUL · 拼成 system prompt (LLMRunner 每次 chat_turn 调一次)."""
     parts = ["你是阿空大邮 (邮箱管理大师) · 帮用户管他自己的邮箱。\n"]
     for name in ("IDENTITY.md", "SOUL.md"):
         p = WORKSPACE / name
@@ -43,7 +38,7 @@ def _load_system_prompt() -> str:
     return "\n".join(parts)
 
 
-def _resolve_dashscope_key() -> str:
+def resolve_dashscope_key() -> str:
     if k := os.getenv("DASHSCOPE_API_KEY"):
         return k
     secrets_path = REPO_ROOT / ".vault" / "secrets.json"
@@ -54,7 +49,7 @@ def _resolve_dashscope_key() -> str:
     raise RuntimeError("DASHSCOPE_API_KEY 没配 · 走 env 或 .vault/secrets.json::dashscope-main.api_key")
 
 
-# ─── Tools 定义 (qwen-plus function calling 格式) ─────────────────────────
+# ─── Tools 定义 (function calling JSON · LLMRunner 透传) ────────────────────
 
 TOOLS = [
     {
@@ -162,7 +157,7 @@ TOOLS = [
 ]
 
 
-# ─── tool 实现 (per user_id 隔离) ────────────────────────────────────────
+# ─── tool 实现 (per user_id 隔离 · 调 imap/smtp + sqlite) ────────────────
 
 
 def _load_account(user_id: str, slug: str) -> dict | None:
@@ -304,66 +299,3 @@ TOOL_IMPLS = {
     "send_draft": _tool_send_draft,
     "archive_message": _tool_archive_message,
 }
-
-
-# ─── chat 主入口 ─────────────────────────────────────────────────────────
-
-
-def chat_turn(user_id: str, messages: list[dict]) -> dict:
-    """单轮 chat · 返回 {reply, tool_calls} · 调用方决定要不要再轮。
-
-    messages: [{role: 'user'|'assistant'|'system'|'tool', content: ...}]
-    返 {reply: str, used_tools: [{name, args, result}]} (tool_calls 内化 · 用户只看自然回复)
-    """
-    dashscope.api_key = _resolve_dashscope_key()
-    sys_prompt = _load_system_prompt()
-    full_msgs = [{"role": "system", "content": sys_prompt}] + messages
-    used_tools: list[dict] = []
-
-    # 最多 5 轮 tool calling (防死循环)
-    for _ in range(5):
-        rsp = Generation.call(
-            model="qwen-plus",
-            messages=full_msgs,
-            tools=TOOLS,
-            result_format="message",
-        )
-        if rsp.status_code != 200:
-            return {"reply": f"LLM 出错: {rsp.message}", "used_tools": used_tools}
-        choice = rsp.output.choices[0]
-        msg = choice.message
-        full_msgs.append(dict(msg))
-
-        tcs = msg.get("tool_calls") if isinstance(msg, dict) else getattr(msg, "tool_calls", None)
-        if not tcs:
-            # 终态: 没 tool · 拿最终自然语言回复
-            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", "")
-            return {"reply": content or "", "used_tools": used_tools}
-
-        # 执行所有 tool calls
-        for tc in tcs:
-            fn = tc["function"] if isinstance(tc, dict) else tc.function
-            name = fn["name"] if isinstance(fn, dict) else fn.name
-            raw_args = fn["arguments"] if isinstance(fn, dict) else fn.arguments
-            try:
-                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            except Exception:
-                args = {}
-            impl = TOOL_IMPLS.get(name)
-            if not impl:
-                result = {"error": f"unknown tool {name}"}
-            else:
-                try:
-                    result = impl(args, user_id)
-                except Exception as e:
-                    result = {"error": f"{type(e).__name__}: {e}"}
-            used_tools.append({"name": name, "args": args, "result": result})
-            tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")
-            full_msgs.append({
-                "role": "tool",
-                "tool_call_id": tc_id,
-                "content": json.dumps(result, ensure_ascii=False),
-            })
-        # 再轮 · 把 tool 结果给 LLM 让它合成最终回复
-
-    return {"reply": "(LLM 调 tool 超 5 轮 · 异常)", "used_tools": used_tools}
