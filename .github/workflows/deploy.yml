@@ -72,7 +72,7 @@ jobs:
           BODY=$(cat <<JSON
           {
             "functionName": "${FC_FUNCTION}",
-            "description": "${FC_FUNCTION} · ACR · 老板 5-7 切容器镜像",
+            "description": "${FC_FUNCTION} · ACR custom-container + NAS",
             "runtime": "custom-container",
             "handler": "not-used",
             "timeout": 600,
@@ -82,6 +82,18 @@ jobs:
               "image": "$IMAGE_VPC",
               "port": 9000,
               "healthCheckConfig": {"httpGetUrl": "/health", "initialDelaySeconds": 5}
+            },
+            "vpcConfig": {
+              "vpcId": "vpc-bp1nt15mmmqn4wo4zja7k",
+              "vSwitchIds": ["vsw-bp1otxzej4a3nzsp7r56q"],
+              "securityGroupId": "sg-bp1b0ke3ei1y5n3k2qs1"
+            },
+            "nasConfig": {
+              "userId": 0,
+              "groupId": 0,
+              "mountPoints": [
+                {"serverAddr": "001qdd0ze49qy8qyci2-gjl85.cn-hangzhou.nas.aliyuncs.com:/", "mountDir": "/mnt/nas"}
+              ]
             },
             "environmentVariables": {
               "DASHSCOPE_API_KEY": "$DASHSCOPE_API_KEY",
